@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+**/auth.json
+**/data/
+**/workspace/
+**/workspaces/
+compose.override.yaml
+*.pem
+*.key
+*.p12
+.DS_Store

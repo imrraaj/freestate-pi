@@ -1,0 +1,9 @@
+**
+!Dockerfile
+!package.json
+!bun.lock
+!tsconfig.json
+!src
+!src/**
+!drizzle
+!drizzle/**

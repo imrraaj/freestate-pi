@@ -1,0 +1,30 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "freestate-pi AMQP terminal result v1",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["version", "runId", "status", "output", "error"],
+    "properties": {
+        "version": { "const": 1 },
+        "runId": { "type": "string", "format": "uuid" },
+        "status": { "enum": ["completed", "failed"] },
+        "output": { "type": ["string", "null"] },
+        "error": { "type": ["string", "null"] }
+    },
+    "oneOf": [
+        {
+            "properties": {
+                "status": { "const": "completed" },
+                "output": { "type": "string" },
+                "error": { "type": "null" }
+            }
+        },
+        {
+            "properties": {
+                "status": { "const": "failed" },
+                "output": { "type": "null" },
+                "error": { "type": "string" }
+            }
+        }
+    ]
+}
