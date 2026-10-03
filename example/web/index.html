@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Local chat</title>
+        <style>
+            :root {
+                color-scheme: light;
+                font-family: system-ui, sans-serif;
+                color: #24312d;
+                background: #f8f7f2;
+            }
+
+            * {
+                box-sizing: border-box;
+            }
+
+            body {
+                margin: 0;
+            }
+
+            main {
+                width: min(100% - 2rem, 46rem);
+                min-height: 100vh;
+                margin: auto;
+                padding: 3rem 0 2rem;
+                display: flex;
+                flex-direction: column;
+                gap: 1.5rem;
+            }
+
+            h1 {
+                margin: 0;
+                font:
+                    2rem/1.15 Georgia,
+                    serif;
+            }
+
+            .hint,
+            #status {
+                color: #4c5d55;
+            }
+            .header-row {
+                display: flex;
+                align-items: start;
+                justify-content: space-between;
+                gap: 1rem;
+            }
+            #new-conversation {
+                background: transparent;
+                color: #235b46;
+                border: 1px solid #89998e;
+            }
+            #new-conversation:hover:not(:disabled) {
+                background: #edf2ec;
+            }
+            .hint {
+                margin: 0.4rem 0 0;
+            }
+            #status {
+                margin: 0;
+                min-height: 1.5em;
+            }
+
+            #messages {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                gap: 1rem;
+            }
+
+            .message {
+                border: 1px solid #d6ddd5;
+                border-radius: 0.5rem;
+                padding: 1rem;
+                background: #fff;
+            }
+
+            .message.user {
+                background: #edf2ec;
+            }
+            .message h2 {
+                margin: 0 0 0.5rem;
+                font-size: 0.875rem;
+            }
+            .message p {
+                margin: 0;
+                white-space: pre-wrap;
+                overflow-wrap: anywhere;
+            }
+
+            form {
+                display: grid;
+                gap: 0.6rem;
+            }
+            label {
+                font-weight: 600;
+            }
+            textarea,
+            button {
+                font: inherit;
+            }
+            textarea {
+                width: 100%;
+                min-height: 6rem;
+                resize: vertical;
+                padding: 0.75rem;
+                border: 1px solid #89998e;
+                border-radius: 0.4rem;
+                background: #fff;
+                color: inherit;
+            }
+
+            button {
+                justify-self: end;
+                border: 0;
+                border-radius: 0.4rem;
+                padding: 0.65rem 1.25rem;
+                color: #fff;
+                background: #235b46;
+                cursor: pointer;
+            }
+
+            button:hover:not(:disabled) {
+                background: #184431;
+            }
+            button:disabled {
+                opacity: 0.6;
+                cursor: not-allowed;
+            }
+            :focus-visible {
+                outline: 2px solid #1d684b;
+                outline-offset: 3px;
+            }
+        </style>
+    </head>
+    <body>
+        <main>
+            <header>
+                <div class="header-row">
+                    <h1>Local chat</h1>
+                    <button id="new-conversation" type="button">
+                        New conversation
+                    </button>
+                </div>
+                <p class="hint">Send a prompt and watch the response arrive.</p>
+            </header>
+
+            <section id="messages" aria-label="Conversation"></section>
+            <p id="status" role="status" aria-live="polite">Ready.</p>
+
+            <form id="chat-form">
+                <label for="prompt">Your message</label>
+                <textarea id="prompt" name="prompt" required></textarea>
+                <button id="send" type="submit">Send</button>
+            </form>
+        </main>
+
+        <script>
+            const form = document.querySelector("#chat-form");
+            const promptField = document.querySelector("#prompt");
+            const sendButton = document.querySelector("#send");
+            const newButton = document.querySelector("#new-conversation");
+            const messages = document.querySelector("#messages");
+            const status = document.querySelector("#status");
+            const storageKey = "local-chat-conversation";
+            const uuidPattern =
+                /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+            let conversation = {
+                threadId: crypto.randomUUID(),
+                turns: [],
+                activeRun: null,
+            };
+            let stream = null;
+            let busy = false;
+
+            function setBusy(value) {
+                busy = value;
+                sendButton.disabled = value;
+                newButton.disabled = value;
+            }
+
+            function addMessage(role, text) {
+                const message = document.createElement("article");
+                message.className = `message ${role}`;
+                const heading = document.createElement("h2");
+                heading.textContent = role === "user" ? "You" : "Assistant";
+                const body = document.createElement("p");
+                body.textContent = text;
+                message.append(heading, body);
+                messages.append(message);
+                return body;
+            }
+
+            function saveConversation() {
+                try {
+                    localStorage.setItem(
+                        storageKey,
+                        JSON.stringify(conversation),
+                    );
+                } catch {
+                    status.textContent =
+                        "Browser storage is unavailable; this conversation will not survive a refresh.";
+                }
+            }
+
+            function connect(runId, prompt, response) {
+                if (stream) stream.close();
+                stream = new EventSource(
+                    `/api/runs/${encodeURIComponent(runId)}/events`,
+                );
+                const currentStream = stream;
+                let lastSequence = -1;
+                status.textContent = "Connecting…";
+
+                currentStream.addEventListener("open", () => {
+                    if (stream === currentStream)
+                        status.textContent = "Running…";
+                });
+
+                currentStream.addEventListener("delta", (event) => {
+                    if (stream !== currentStream) return;
+                    try {
+                        const data = JSON.parse(event.data);
+                        if (
+                            data.runId !== runId ||
+                            !Number.isSafeInteger(data.sequence) ||
+                            typeof data.delta !== "string"
+                        ) {
+                            throw new Error("Invalid delta");
+                        }
+                        if (data.sequence <= lastSequence) return;
+                        lastSequence = data.sequence;
+                        if (response.dataset.pending === "true") {
+                            response.textContent = "";
+                            delete response.dataset.pending;
+                        }
+                        response.textContent += data.delta;
+                    } catch {
+                        status.textContent =
+                            "Could not read the response stream.";
+                        currentStream.close();
+                        stream = null;
+                        setBusy(false);
+                    }
+                });
+
+                currentStream.addEventListener("result", (event) => {
+                    if (stream !== currentStream) return;
+                    try {
+                        const data = JSON.parse(event.data);
+                        if (
+                            data.version !== 1 ||
+                            data.runId !== runId ||
+                            !["completed", "failed"].includes(data.status) ||
+                            (data.threadId !== undefined &&
+                                data.threadId !== conversation.threadId)
+                        ) {
+                            throw new Error("Invalid result");
+                        }
+                        if (data.status === "completed") {
+                            if (typeof data.output !== "string")
+                                throw new Error("Invalid output");
+                            response.textContent = data.output;
+                            conversation.turns.push({
+                                prompt,
+                                output: data.output,
+                            });
+                            status.textContent = "Completed.";
+                        } else {
+                            response.textContent =
+                                typeof data.error === "string" && data.error
+                                    ? data.error
+                                    : "Run failed.";
+                            status.textContent = "Failed.";
+                        }
+                        conversation.activeRun = null;
+                        saveConversation();
+                    } catch {
+                        status.textContent = "Could not read the final result.";
+                    } finally {
+                        delete response.dataset.pending;
+                        currentStream.close();
+                        stream = null;
+                        setBusy(false);
+                    }
+                });
+
+                currentStream.addEventListener("error", () => {
+                    if (stream !== currentStream) return;
+                    if (currentStream.readyState === EventSource.CLOSED) {
+                        status.textContent =
+                            "Connection closed before a result. Send a new message or reload to retry.";
+                        stream = null;
+                        setBusy(false);
+                    } else {
+                        // EventSource reconnects automatically with Last-Event-ID. Keep the partial output.
+                        status.textContent = "Connection lost. Reconnecting…";
+                    }
+                });
+            }
+
+            form.addEventListener("submit", async (event) => {
+                event.preventDefault();
+                if (busy) return;
+                const prompt = promptField.value.trim();
+                if (!prompt) {
+                    status.textContent = "Enter a message first.";
+                    promptField.focus();
+                    return;
+                }
+
+                setBusy(true);
+                status.textContent = "Starting run…";
+                try {
+                    const reply = await fetch("/api/runs", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            prompt,
+                            threadId: conversation.threadId,
+                        }),
+                    });
+                    if (reply.status !== 202)
+                        throw new Error(
+                            `Request failed (HTTP ${reply.status}).`,
+                        );
+                    const data = await reply.json();
+                    if (
+                        typeof data.runId !== "string" ||
+                        !data.runId ||
+                        data.threadId !== conversation.threadId
+                    ) {
+                        throw new Error(
+                            "Server returned an invalid run or thread ID.",
+                        );
+                    }
+
+                    conversation.activeRun = { runId: data.runId, prompt };
+                    saveConversation();
+                    addMessage("user", prompt);
+                    const response = addMessage(
+                        "assistant",
+                        "Waiting for response…",
+                    );
+                    response.dataset.pending = "true";
+                    promptField.value = "";
+                    connect(data.runId, prompt, response);
+                } catch (error) {
+                    status.textContent =
+                        error instanceof Error
+                            ? error.message
+                            : "Could not start the run.";
+                    setBusy(false);
+                }
+            });
+
+            newButton.addEventListener("click", () => {
+                if (busy) return;
+                conversation = {
+                    threadId: crypto.randomUUID(),
+                    turns: [],
+                    activeRun: null,
+                };
+                messages.replaceChildren();
+                promptField.value = "";
+                status.textContent = "New conversation ready.";
+                saveConversation();
+                promptField.focus();
+            });
+
+            try {
+                const saved = localStorage.getItem(storageKey);
+                if (saved) {
+                    const restored = JSON.parse(saved);
+                    if (
+                        uuidPattern.test(restored.threadId) &&
+                        Array.isArray(restored.turns) &&
+                        restored.turns.every(
+                            (turn) =>
+                                typeof turn.prompt === "string" &&
+                                typeof turn.output === "string",
+                        ) &&
+                        (restored.activeRun === null ||
+                            (typeof restored.activeRun?.runId === "string" &&
+                                restored.activeRun.runId &&
+                                typeof restored.activeRun.prompt === "string"))
+                    ) {
+                        conversation = restored;
+                        for (const turn of conversation.turns) {
+                            addMessage("user", turn.prompt);
+                            addMessage("assistant", turn.output);
+                        }
+                        if (conversation.activeRun) {
+                            const { runId, prompt } = conversation.activeRun;
+                            addMessage("user", prompt);
+                            const response = addMessage(
+                                "assistant",
+                                "Restoring last run…",
+                            );
+                            response.dataset.pending = "true";
+                            setBusy(true);
+                            connect(runId, prompt, response);
+                        }
+                    }
+                }
+            } catch {
+                // Invalid or unavailable storage does not prevent starting a new conversation.
+            }
+        </script>
+    </body>
+</html>

@@ -1,0 +1,14 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "freestate-pi RabbitMQ stream text delta v1",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["version", "runId", "type", "sequence", "delta"],
+    "properties": {
+        "version": { "const": 1 },
+        "runId": { "type": "string", "format": "uuid" },
+        "type": { "const": "text_delta" },
+        "sequence": { "type": "integer", "minimum": 1 },
+        "delta": { "type": "string", "minLength": 1 }
+    }
+}

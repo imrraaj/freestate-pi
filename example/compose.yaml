@@ -1,0 +1,68 @@
+services:
+    postgres:
+        image: postgres:17-alpine
+        environment:
+            POSTGRES_USER: demo
+            POSTGRES_PASSWORD: ${EXAMPLE_DB_PASSWORD:-61acce4ca05d7c6f4daa78d8fc26df4e7b69d533}
+            POSTGRES_DB: demo
+        volumes:
+            - postgres-data:/var/lib/postgresql/data
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U demo -d demo"]
+            interval: 3s
+            timeout: 3s
+            retries: 20
+        restart: unless-stopped
+
+    rabbitmq:
+        image: rabbitmq:4-management-alpine
+        environment:
+            RABBITMQ_DEFAULT_USER: demo
+            RABBITMQ_DEFAULT_PASS: ${EXAMPLE_AMQP_PASSWORD:-3bb2c86f22560afb2b8f12c75a211ea58e6bd7e2}
+        volumes:
+            - rabbitmq-data:/var/lib/rabbitmq
+        healthcheck:
+            test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+            interval: 5s
+            timeout: 5s
+            retries: 20
+        restart: unless-stopped
+
+    runner:
+        build:
+            context: ..
+            dockerfile: Dockerfile
+        environment:
+            DATABASE_URL: postgres://demo:${EXAMPLE_DB_PASSWORD:-61acce4ca05d7c6f4daa78d8fc26df4e7b69d533}@postgres:5432/demo
+            RABBITMQ_URL: amqp://demo:${EXAMPLE_AMQP_PASSWORD:-3bb2c86f22560afb2b8f12c75a211ea58e6bd7e2}@rabbitmq:5672
+            DEFAULT_MODEL: ${EXAMPLE_MODEL:-openai-codex/gpt-5.6-luna}
+        volumes:
+            - ./auth.json:/pi-agent/auth.json:rw
+            - workspace:/workspace
+        depends_on:
+            postgres:
+                condition: service_healthy
+            rabbitmq:
+                condition: service_healthy
+        restart: unless-stopped
+
+    web:
+        build: ./web
+        environment:
+            RABBITMQ_URL: amqp://demo:${EXAMPLE_AMQP_PASSWORD:-3bb2c86f22560afb2b8f12c75a211ea58e6bd7e2}@rabbitmq:5672
+            RESULT_DIR: /data
+            PORT: 8081
+        volumes:
+            - web-results:/data
+        ports:
+            - "8081:8081"
+        depends_on:
+            rabbitmq:
+                condition: service_healthy
+        restart: unless-stopped
+
+volumes:
+    postgres-data:
+    rabbitmq-data:
+    workspace:
+    web-results:

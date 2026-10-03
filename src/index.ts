@@ -27,6 +27,7 @@ async function main(): Promise<void> {
         runTimeoutMs,
         requestQueue: process.env.REQUEST_QUEUE ?? "freestate-pi.requests.v1",
         resultQueue: process.env.RESULT_QUEUE ?? "freestate-pi.results.v1",
+        eventStream: process.env.EVENT_STREAM ?? "freestate-pi.events.v1",
     });
 
     let closing = false;

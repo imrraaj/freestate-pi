@@ -1,0 +1,6 @@
+auth.json
+.env
+.env.*
+compose.override.yaml
+workspace/
+data/

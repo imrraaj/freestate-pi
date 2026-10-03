@@ -3,19 +3,22 @@
     "title": "freestate-pi AMQP request v1",
     "type": "object",
     "additionalProperties": false,
-    "required": ["version", "runId", "prompt", "model"],
+    "required": ["version", "runId", "prompt"],
     "properties": {
         "version": { "const": 1 },
         "runId": { "type": "string", "format": "uuid" },
+        "threadId": { "type": "string", "format": "uuid" },
         "prompt": { "type": "string", "minLength": 1, "maxLength": 50000 },
         "model": {
             "type": "string",
             "minLength": 3,
             "maxLength": 200,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:/-]*$"
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:/-]*$",
+            "default": "openai-codex/gpt-5.6-luna"
         },
         "thinking": {
-            "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+            "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+            "default": "off"
         }
     }
 }

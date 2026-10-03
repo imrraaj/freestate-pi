@@ -1,6 +1,6 @@
 # freestate-pi: queue-only Pi worker
 
-This repository builds a Docker image that consumes **AMQP 0-9-1 request messages** and publishes final results to **AMQP result messages**. It has no HTTP server, published port, frontend, or user authentication. The operator's backend is the only producer/consumer; it handles user authentication, rate limits, and delivery to its frontend.
+This repository builds a Docker image that consumes **AMQP 0-9-1 request messages**, streams text deltas to a **replayable RabbitMQ stream**, and publishes final results to **AMQP result messages**. It has no HTTP server, published port, frontend, or user authentication. The operator's backend is the only producer/consumer; it handles user authentication, rate limits, and delivery to its frontend.
 
 ## Build and run
 
@@ -8,7 +8,7 @@ This repository builds a Docker image that consumes **AMQP 0-9-1 request message
 docker build -t freestate-pi:0.1.0 .
 ```
 
-Provide an external PostgreSQL database, an AMQP 0-9-1 broker (tested with RabbitMQ), a writable workspace, and your own Pi `auth.json`. The image creates its own `pi_runner` schema and tables on startup in a **dedicated fresh database**; there are no migration files or destructive startup resets. Schema changes in future versions will require a planned upgrade or a fresh database. It does not bundle a database or broker. PostgreSQL stores deduplication, runs, and pending result publications. Both PostgreSQL and RabbitMQ need persistent storage.
+Provide an external PostgreSQL database, a RabbitMQ broker with stream queues, a writable workspace, and your own Pi `auth.json`. The image creates its own `pi_runner` schema and tables on startup in a **dedicated fresh database**; there are no migration files or destructive startup resets. Schema changes in future versions will require a planned upgrade or a fresh database. It does not bundle a database or broker. PostgreSQL stores deduplication, runs, and pending result publications. Both PostgreSQL and RabbitMQ need persistent storage.
 
 ```yaml
 services:
@@ -19,7 +19,9 @@ services:
             RABBITMQ_URL: ${RABBITMQ_URL:?required}
             REQUEST_QUEUE: freestate-pi.requests.v1
             RESULT_QUEUE: freestate-pi.results.v1
+            EVENT_STREAM: freestate-pi.events.v1
             RUN_TIMEOUT_MS: 1200000
+            # DEFAULT_MODEL: openai-codex/gpt-5.6-luna (optional override)
         volumes:
             - ${PI_AUTH_FILE:?absolute path to auth.json}:/pi-agent/auth.json
             - freestate-pi-work:/workspace
@@ -38,25 +40,24 @@ networks:
 
 `PI_AUTH_FILE` is the operator's own Pi-compatible file, **not a credential included in this source tree**. OAuth token refresh may require write access to it. The image runs as an unprivileged user (UID 1000); make the workspace and auth mount accessible to that user. All replicas must share the same persistent `/workspace` mount if their generated files must be visible to the backend. Containers also need outbound access to their chosen model provider.
 
-`REQUEST_QUEUE` and `RESULT_QUEUE` can be set to **any valid durable queue names** on the configured AMQP broker. Every replica in one installation must use the same queue names and PostgreSQL database. These are AMQP queues, not interchangeable SQS/Kafka URLs. Do not publish broker credentials or queue access to the browser.
+`REQUEST_QUEUE` and `RESULT_QUEUE` can be set to **any valid durable queue names** on the configured RabbitMQ broker. `EVENT_STREAM` is a separate RabbitMQ stream queue, declared with `x-queue-type=stream`, `x-max-age=1D`, and `x-max-length-bytes=1,000,000,000`. An existing stream with the same name must have compatible declaration arguments. Every replica in one installation must use the same three names and PostgreSQL database. These are AMQP queues, not interchangeable SQS/Kafka URLs. Do not publish broker credentials or queue access to the browser.
 
 ## Version 1 message contract
 
-Machine-readable schemas: [`contracts/request.v1.schema.json`](contracts/request.v1.schema.json) and [`contracts/result.v1.schema.json`](contracts/result.v1.schema.json).
+Machine-readable schemas: [`contracts/request.v1.schema.json`](contracts/request.v1.schema.json), [`contracts/event.v1.schema.json`](contracts/event.v1.schema.json), and [`contracts/result.v1.schema.json`](contracts/result.v1.schema.json).
 
-The backend declares the durable result queue and the durable request queue (the worker also declares both), then publishes a **persistent** UTF-8 JSON request to `REQUEST_QUEUE` with `contentType: "application/json"`. Required fields:
+The backend declares the durable result queue and the durable request queue (the worker also declares both), then publishes a **persistent** UTF-8 JSON request to `REQUEST_QUEUE` with `contentType: "application/json"`. A minimal request:
 
 ```json
 {
     "version": 1,
     "runId": "29fa5ab4-cfa8-4c96-b63d-76ca82a4b1a9",
-    "prompt": "Create a small HTML landing page.",
-    "model": "openai-codex/gpt-6-luna",
-    "thinking": "low"
+    "threadId": "dd18863a-9b73-4cd5-b402-d83566572d7c",
+    "prompt": "Create a small HTML landing page."
 }
 ```
 
-`runId` is a UUID generated by the backend and **unique per run**. Reusing an ID must never mean a different request. `prompt` is a nonempty string (at most 50,000 characters); `model` is a Pi `provider/model` identifier. `thinking` is optional: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. `version: 1` is required. The backend should retain the run ID so it can correlate the result with its user request. Send each run as one message; multiple messages with the same run ID are deduplicated by PostgreSQL. The model shown is only an example: select an actual model available to your Pi installation and credentials.
+`runId` is a UUID generated by the backend and **unique per turn**. Reusing an ID must never mean a different request. `threadId` is optional: use the same UUID for every turn of one conversation, or omit it for an independent stateless run. Wait for a turn's terminal result before submitting the next turn in that thread; concurrent requests are serialized but their order is not guaranteed. Your backend must check that its user owns the thread before publishing a turn. `prompt` is a nonempty string (at most 50,000 characters). `model` is optional and defaults to `openai-codex/gpt-5.6-luna` (override globally with `DEFAULT_MODEL`, or per request with a Pi `provider/model` identifier). `thinking` is optional and defaults to `off`; per-request values are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Check that your configured Pi credentials/catalog provide the selected model. `version: 1` is required. The backend should retain the run ID so it can correlate the result with its user request. Send each run as one message; multiple messages with the same run ID are deduplicated by PostgreSQL.
 
 The worker publishes a terminal result for the run to `RESULT_QUEUE`, also as **persistent** UTF-8 JSON with `contentType: "application/json"` (at-least-once delivery means duplicates are possible):
 
@@ -64,18 +65,41 @@ The worker publishes a terminal result for the run to `RESULT_QUEUE`, also as **
 {
     "version": 1,
     "runId": "29fa5ab4-cfa8-4c96-b63d-76ca82a4b1a9",
+    "threadId": "dd18863a-9b73-4cd5-b402-d83566572d7c",
     "status": "completed",
     "output": "The landing page is ready.",
     "error": null
 }
 ```
 
-For failure, `status` is `"failed"`, `output` is `null`, and `error` is a safe, non-secret explanation. The result is terminal: **there is no polling or progress message**. Pi-created files are in the shared volume at `runs/<runId>/`; the backend chooses how to serve them to users. Never expect container filesystem files inside an AMQP message.
+For failure, `status` is `"failed"`, `output` is `null`, and `error` is a safe, non-secret explanation. Pi runs in JSON event mode: **text deltas are published while it generates**, but the result above is published only after the full run finishes and remains authoritative. Pi-created files are in the shared volume at `runs/<runId>/` for independent runs or `threads/<threadId>/` for threaded runs; the backend chooses how to serve them to users. Never expect container filesystem files inside an AMQP message.
 
 **Acknowledgement rules:** the backend should use a publisher-confirm channel for requests, consume results with manual acknowledgements, persist each result under its `runId` in its own store, then acknowledge it. AMQP can deliver a result more than once after a crash: deduplicate by `runId`, not delivery tag. The worker acknowledges a request only after its final result has been durably recorded/published. A worker crash or lease expiry during execution produces a **failed** result rather than rerunning potentially file-changing Pi tools. Invalid requests are rejected; configure a broker dead-letter queue/policy if you need to inspect them.
 
 RabbitMQ distributes _one message_ among replicas sharing `REQUEST_QUEUE` (each uses prefetch 1). Publishing two messages with the same `runId` may deliver them to different replicas, but only one can atomically claim that ID in PostgreSQL. Increase replicas to process more **different** run IDs in parallel. No client needs the worker's Postgres credentials or direct filesystem access unless it intends to serve generated files.
 
+## Replayable text stream
+
+The worker batches Pi `text_delta` events about every 100 ms and appends persistent JSON messages to `EVENT_STREAM`:
+
+```json
+{
+    "version": 1,
+    "runId": "29fa5ab4-cfa8-4c96-b63d-76ca82a4b1a9",
+    "type": "text_delta",
+    "sequence": 1,
+    "delta": "The landing"
+}
+```
+
+This is **one shared stream for all runs**, not a queue per run. To replay after a frontend refresh, your backend creates a RabbitMQ stream consumer with per-consumer QoS/prefetch and manual acknowledgements, supplying `x-stream-offset: "first"` (or a timestamp just before the run was submitted). It validates events against the event schema, filters by `runId`, and forwards only sequences newer than the client's last SSE event ID. Once replay catches up, the same consumer continues receiving live events. Acknowledging a stream event provides consumer credit; it does **not** delete the event. Regular AMQP queue consumers without `x-stream-offset` start at the next new stream event and will miss the earlier text. See [RabbitMQ Streams](https://www.rabbitmq.com/docs/streams).
+
+A global stream can become expensive to rescan from `first` as traffic grows; use a submitted-at timestamp or a native RabbitMQ Stream client with offset tracking/filtering at scale. Retention (1 day or 1 GB by default) can remove old events, so use the backend's saved **final result** when the stream is no longer available. Stream messages can contain sensitive answer text: limit broker/vhost access to trusted backend and worker processes. Progress is best-effort during a broker interruption; the durable final result remains the source of truth. Text from intermediate Pi tool turns can differ from the final answer—replace the displayed partial text with the final `output` on completion.
+
+## Local chat example
+
+[`example/README.md`](example/README.md) runs a loopback-only chat page and its PostgreSQL/RabbitMQ/worker services with Docker Compose. It shows live text, replay after refresh, a persistent conversation thread across prompts, and the final result.
+
 ## Validation status
 
-The image was built from this code and the AMQP → Postgres → Pi subprocess → AMQP path was exercised against disposable PostgreSQL and RabbitMQ using a test Pi executable. A real provider invocation needs the operator's own `auth.json`; no credential is included in this repository or image.
+The image was built from this code and tested against disposable PostgreSQL/RabbitMQ using a Pi JSON-mode stub. Live text reached the RabbitMQ stream before the terminal result; after disconnecting on the first chunk, a new stream consumer replayed that chunk and followed the remaining chunks. The final result and default model/thinking were also verified in Postgres. The Compose example was tested with operator-provided credentials and the default model: two consecutive turns on one thread streamed text, and the second recalled information from the first. No credential is included in this repository or image.
